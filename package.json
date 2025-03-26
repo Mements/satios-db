@@ -1,6 +1,8 @@
 {
-  "name": "satios-db",
-  "module": "index.ts",
+  "name": "@satios/db",
+  "version": "1.0.0",
+  "module": "./src/database.ts",
+  "main": "./src/database.ts",
   "type": "module",
   "private": true,
   "devDependencies": {
