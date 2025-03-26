@@ -1,22 +1,22 @@
-// examples/exchange/simulation.ts
 import { z } from "zod";
 import path from "path";
 import os from "os";
 import { rm } from "node:fs/promises";
-import { createDatabase, type SatiDatabase, type ChangeEvent, type DatabaseRecord } from "../src/database"
+import { createDatabase, SatiDatabase, DatabaseRecord } from "../youtube-twitter-agent/databases/core"; // Adjust path
+import { measure, MeasureFunction } from "./measure"; // Adjust path
 
 // --- Configuration ---
-const SIMULATION_DURATION_MS = 35 * 1000; // Run for 35 seconds
-const TRANSACTION_INTERVAL_MS = 500;    // ~2 transactions per second
-const CANDLE_INTERVAL_MS = 10 * 1000;   // 1 candle every 10 seconds
+const SIMULATION_ID = `SIM-${Date.now().toString().slice(-4)}`;
+const SIMULATION_DURATION_MS = 35 * 1000;
+const TRANSACTION_INTERVAL_MS = 500;
+const CANDLE_INTERVAL_MS = 10 * 1000;
 const TICKER_SYMBOL = "BTC-USD";
-const DB_BASE_PATH = path.join(os.tmpdir(), `exchange_sim_${Date.now()}`); // Use temp dir for isolation
+const DB_BASE_PATH = path.join(os.tmpdir(), `exchange_sim_measured_${Date.now()}`);
 
 // --- Schemas ---
 const CandleInputSchema = z.object({
     ticker: z.string(),
-    // Timestamp represents the *start* time of the candle interval
-    timestamp: z.number().int(), // Unix timestamp (seconds)
+    timestamp: z.number().int(),
 });
 const CandleOutputSchema = z.object({
     open: z.number(),
@@ -26,15 +26,14 @@ const CandleOutputSchema = z.object({
     volume: z.number(),
 });
 
-// Need a unique identifier per transaction in the input
 const TransactionInputSchema = z.object({
     ticker: z.string(),
-    transactionId: z.string(), // Unique ID for each trade
+    transactionId: z.string(),
 });
 const TransactionOutputSchema = z.object({
     price: z.number(),
     quantity: z.number(),
-    timestamp: z.number(), // Unix timestamp (milliseconds)
+    timestamp: z.number(),
     side: z.enum(['buy', 'sell']),
 });
 
@@ -43,7 +42,7 @@ const TickerInputSchema = z.object({
 });
 const TickerOutputSchema = z.object({
     currentPrice: z.number().optional(),
-    lastUpdatedAt: z.number().optional(), // Unix timestamp (milliseconds)
+    lastUpdatedAt: z.number().optional(),
 });
 
 // --- Type Aliases ---
@@ -51,22 +50,21 @@ type Transaction = DatabaseRecord<z.infer<typeof TransactionInputSchema>, z.infe
 type Candle = DatabaseRecord<z.infer<typeof CandleInputSchema>, z.infer<typeof CandleOutputSchema>>;
 type Ticker = DatabaseRecord<z.infer<typeof TickerInputSchema>, z.infer<typeof TickerOutputSchema>>;
 
-// --- Simulation State ---
-let recentTransactions: Transaction[] = [];
-let transactionListenerStop: (() => void) | null = null;
-let transactionIntervalId: Timer | null = null;
-let candleIntervalId: Timer | null = null;
+type ExchangeDatabases = {
+    candlesDb: SatiDatabase<typeof CandleInputSchema, typeof CandleOutputSchema>;
+    transactionsDb: SatiDatabase<typeof TransactionInputSchema, typeof TransactionOutputSchema>;
+    tickersDb: SatiDatabase<typeof TickerInputSchema, typeof TickerOutputSchema>;
+};
 
 // --- Helper Functions ---
-function generateRandomTransaction(ticker: string): Omit<Transaction, 'id'> {
+function generateRandomTransactionData(ticker: string): Omit<Transaction, 'id'> {
     const now = Date.now();
-    const price = 30000 + (Math.random() - 0.5) * 1000; // Simulate price fluctuation
-    const quantity = Math.random() * 0.5 + 0.01; // Simulate quantity
+    const price = 30000 + (Math.random() - 0.5) * 1000;
+    const quantity = Math.random() * 0.5 + 0.01;
     const side = Math.random() > 0.5 ? 'buy' : 'sell';
     return {
         input: {
             ticker: ticker,
-            // Simple unique ID using timestamp and random element
             transactionId: `tx-${now}-${Math.random().toString(16).slice(2, 8)}`
         },
         output: {
@@ -78,191 +76,217 @@ function generateRandomTransaction(ticker: string): Omit<Transaction, 'id'> {
     };
 }
 
-// --- Database Initialization ---
-async function setupDatabases() {
-    console.log(`Using database path: ${DB_BASE_PATH}`);
+async function createExchangeDatabases(m: MeasureFunction): Promise<ExchangeDatabases> {
+    return m(async (m2) => {
+        const candlesDb = await m2(() => Promise.resolve(
+            createDatabase("exchange_candles", CandleInputSchema, CandleOutputSchema, path.join(DB_BASE_PATH, "candles.sqlite"))
+        ), "Create Candles DB Instance");
 
-    const candlesDb = createDatabase("exchange_candles", CandleInputSchema, CandleOutputSchema, path.join(DB_BASE_PATH, "candles.sqlite"));
-    const transactionsDb = createDatabase("exchange_transactions", TransactionInputSchema, TransactionOutputSchema, path.join(DB_BASE_PATH, "transactions.sqlite"));
-    const tickersDb = createDatabase("exchange_tickers", TickerInputSchema, TickerOutputSchema, path.join(DB_BASE_PATH, "tickers.sqlite"));
+        const transactionsDb = await m2(() => Promise.resolve(
+            createDatabase("exchange_transactions", TransactionInputSchema, TransactionOutputSchema, path.join(DB_BASE_PATH, "transactions.sqlite"))
+        ), "Create Transactions DB Instance");
 
-    await candlesDb.init();
-    await transactionsDb.init();
-    await tickersDb.init();
+        const tickersDb = await m2(() => Promise.resolve(
+            createDatabase("exchange_tickers", TickerInputSchema, TickerOutputSchema, path.join(DB_BASE_PATH, "tickers.sqlite"))
+        ), "Create Tickers DB Instance");
 
-    // Optional: Initialize ticker if it doesn't exist
-    await tickersDb.insert({ ticker: TICKER_SYMBOL }, { currentPrice: undefined, lastUpdatedAt: undefined });
+        await m2(() => candlesDb.init(), "Initialize Candles DB");
+        await m2(() => transactionsDb.init(), "Initialize Transactions DB");
+        await m2(() => tickersDb.init(), "Initialize Tickers DB");
 
-    return { candlesDb, transactionsDb, tickersDb };
+        await m2(() => tickersDb.insert({ ticker: TICKER_SYMBOL }, { currentPrice: undefined, lastUpdatedAt: undefined }),
+            "Initialize Ticker Record");
+
+        return { candlesDb, transactionsDb, tickersDb };
+    }, "Setup Databases");
 }
 
-// --- Simulation Logic ---
-async function runSimulation(
-    candlesDb: SatiDatabase<typeof CandleInputSchema, typeof CandleOutputSchema>,
-    transactionsDb: SatiDatabase<typeof TransactionInputSchema, typeof TransactionOutputSchema>,
-    tickersDb: SatiDatabase<typeof TickerInputSchema, typeof TickerOutputSchema>
-) {
-    console.log("Starting simulation...");
+async function runTransactionSimulator(m: MeasureFunction, db: SatiDatabase<typeof TransactionInputSchema, typeof TransactionOutputSchema>): Promise<() => void> {
+    return m(async () => {
+        const intervalId = setInterval(async () => {
+            await measure(async (m2) => {
+                const newTxData = generateRandomTransactionData(TICKER_SYMBOL);
+                await m2(() => db.insert(newTxData.input, newTxData.output),
+                    `Insert Transaction ${newTxData.input.transactionId}`);
+            }, "Simulate Single Transaction", { requestId: SIMULATION_ID, level: 1 }); // Use top-level measure for interval actions
+        }, TRANSACTION_INTERVAL_MS);
 
-    // 1. Listen for new transactions and buffer them
-    const listener = transactionsDb.listen((event: ChangeEvent<z.infer<typeof TransactionInputSchema>, z.infer<typeof TransactionOutputSchema>>) => {
-        // We only care about newly added full records (input + output)
-        if (event.type === 'output_added' && event.input && event.output) {
-            // Ensure the transaction is for the ticker we care about (though in this sim, it always is)
-            if (event.input.ticker === TICKER_SYMBOL) {
-                console.log(`[Listener] Received new transaction: ${event.input.transactionId}, Price: ${event.output.price}`);
-                recentTransactions.push({ id: event.id, input: event.input, output: event.output });
+        const stop = () => clearInterval(intervalId);
+        return stop;
+    }, "Start Transaction Simulator");
+}
+
+
+async function aggregateCandleAndBroadcast(m: MeasureFunction, dbs: ExchangeDatabases, lastProcessedTimestamp: number): Promise<number> {
+    return m(async (m2) => {
+        const newTransactions = await m2(() =>
+            dbs.transactionsDb.find(
+                { ticker: TICKER_SYMBOL }, // Input filter
+                { timestamp: undefined } // Placeholder for output filter, needs adjustment if querying by output
+            ).then(txs => txs.filter(tx => tx.output && tx.output.timestamp > lastProcessedTimestamp)
+                             .sort((a, b) => a.output!.timestamp - b.output!.timestamp) // Ensure order
+            ),
+            `Find New Transactions since ${lastProcessedTimestamp}`
+        );
+
+
+        if (newTransactions.length === 0) {
+            // No action needed, return the same timestamp
+            return lastProcessedTimestamp;
+        }
+
+        const latestTimestamp = newTransactions[newTransactions.length - 1].output!.timestamp;
+
+        await m2(async (m3) => {
+            const transactionsToProcess = newTransactions;
+
+            let open = transactionsToProcess[0].output!.price;
+            let high = open;
+            let low = open;
+            let close = transactionsToProcess[transactionsToProcess.length - 1].output!.price;
+            let volume = 0;
+            let firstTimestamp = transactionsToProcess[0].output!.timestamp;
+            const candleTimestampSec = Math.floor(firstTimestamp / 1000 / (CANDLE_INTERVAL_MS / 1000)) * (CANDLE_INTERVAL_MS / 1000);
+
+            for (const tx of transactionsToProcess) {
+                const price = tx.output!.price;
+                high = Math.max(high, price);
+                low = Math.min(low, price);
+                volume += tx.output!.quantity;
             }
-        }
-    });
-    transactionListenerStop = listener.stop; // Store stop function for cleanup
 
-    // 2. Simulate new transactions arriving
-    transactionIntervalId = setInterval(async () => {
-        const newTxData = generateRandomTransaction(TICKER_SYMBOL);
-        try {
-            const { id } = await transactionsDb.insert(newTxData.input, newTxData.output);
-            // console.log(`[Generator] Inserted transaction ${newTxData.input.transactionId} (DB ID: ${id})`);
-        } catch (error) {
-            console.error(`[Generator] Error inserting transaction:`, error);
-        }
-    }, TRANSACTION_INTERVAL_MS);
+            const candleInput: z.infer<typeof CandleInputSchema> = {
+                ticker: TICKER_SYMBOL,
+                timestamp: candleTimestampSec,
+            };
+            const candleOutput: z.infer<typeof CandleOutputSchema> = {
+                open: open,
+                high: parseFloat(high.toFixed(2)),
+                low: parseFloat(low.toFixed(2)),
+                close: close,
+                volume: parseFloat(volume.toFixed(6)),
+            };
 
-    // 3. Periodically aggregate transactions into candles
-    candleIntervalId = setInterval(async () => {
-        const transactionsToProcess = [...recentTransactions]; // Copy buffer
-        recentTransactions = []; // Clear buffer immediately
+            const { id: candleId } = await m3(() => dbs.candlesDb.insert(candleInput, candleOutput),
+                `Save Candle ${TICKER_SYMBOL} @ ${new Date(candleTimestampSec * 1000).toISOString()}`);
 
-        if (transactionsToProcess.length === 0) {
-            console.log(`[Candle Aggregator] No new transactions in this interval.`);
-            return;
-        }
-
-        console.log(`[Candle Aggregator] Processing ${transactionsToProcess.length} transactions...`);
-
-        // Calculate OHLCV
-        let open = transactionsToProcess[0].output!.price;
-        let high = open;
-        let low = open;
-        let close = transactionsToProcess[transactionsToProcess.length - 1].output!.price;
-        let volume = 0;
-        let firstTimestamp = transactionsToProcess[0].output!.timestamp;
-        // Candle timestamp should align to the start of the interval
-        const candleTimestampSec = Math.floor(firstTimestamp / 1000 / (CANDLE_INTERVAL_MS / 1000)) * (CANDLE_INTERVAL_MS / 1000);
-
-
-        for (const tx of transactionsToProcess) {
-            const price = tx.output!.price;
-            high = Math.max(high, price);
-            low = Math.min(low, price);
-            volume += tx.output!.quantity;
-        }
-
-        const candleInput: z.infer<typeof CandleInputSchema> = {
-            ticker: TICKER_SYMBOL,
-            timestamp: candleTimestampSec,
-        };
-        const candleOutput: z.infer<typeof CandleOutputSchema> = {
-            open: open,
-            high: parseFloat(high.toFixed(2)),
-            low: parseFloat(low.toFixed(2)),
-            close: close,
-            volume: parseFloat(volume.toFixed(6)),
-        };
-
-        try {
-            // Insert/Update the candle
-            const { id: candleId } = await candlesDb.insert(candleInput, candleOutput);
-            console.log(`[Candle Aggregator] Saved Candle ${TICKER_SYMBOL} @ ${new Date(candleTimestampSec * 1000).toISOString()} (DB ID: ${candleId}) O:${open} H:${high} L:${low} C:${close} V:${volume}`);
-
-            // Update the ticker's current price
             const tickerInput: z.infer<typeof TickerInputSchema> = { ticker: TICKER_SYMBOL };
             const tickerOutput: z.infer<typeof TickerOutputSchema> = {
                 currentPrice: close,
                 lastUpdatedAt: Date.now(),
             };
-            const { id: tickerId } = await tickersDb.update(tickerInput, tickerOutput);
-            console.log(`[Ticker Update] Updated ${TICKER_SYMBOL} price to ${close} (DB ID: ${tickerId})`);
+            const { id: tickerId } = await m3(() => dbs.tickersDb.update(tickerInput, tickerOutput),
+                `Update Ticker ${TICKER_SYMBOL} to ${close}`);
 
-            // --- Simulate Broadcasting via WebSockets (using console.log) ---
-            console.log(`--- BROADCAST START ---`);
-            // 1. Broadcast new candle
-            console.log(`[WebSocket Broadcast] New Candle:`, { input: candleInput, output: candleOutput });
-            // 2. Broadcast updated ticker
-            console.log(`[WebSocket Broadcast] Ticker Update:`, { input: tickerInput, output: tickerOutput });
-            // 3. Broadcast list of new transactions included in this candle interval
-            console.log(`[WebSocket Broadcast] New Transactions (${transactionsToProcess.length}):`, transactionsToProcess.map(tx => ({ id: tx.input.transactionId, ...tx.output })));
-            console.log(`--- BROADCAST END ---`);
+            await m3(async () => {
+                 console.log(`--- BROADCAST START (Candle ${candleId}, Ticker ${tickerId}) ---`);
+                 console.log(`[WebSocket Broadcast] New Candle:`, { input: candleInput, output: candleOutput });
+                 console.log(`[WebSocket Broadcast] Ticker Update:`, { input: tickerInput, output: tickerOutput });
+                 console.log(`[WebSocket Broadcast] New Transactions (${transactionsToProcess.length}):`, transactionsToProcess.map(tx => ({ id: tx.input.transactionId, ...tx.output })));
+                 console.log(`--- BROADCAST END ---`);
+            }, "Simulate WebSocket Broadcast");
 
-        } catch (error) {
-            console.error(`[Candle Aggregator] Error processing interval:`, error);
-        }
+        }, `Process ${newTransactions.length} Transactions into Candle`);
 
-    }, CANDLE_INTERVAL_MS);
+        return latestTimestamp; // Return the timestamp of the last processed transaction
 
-    // --- Stop Simulation after duration ---
-    await new Promise(resolve => setTimeout(resolve, SIMULATION_DURATION_MS));
-
-    console.log("Stopping simulation...");
-    if (transactionListenerStop) transactionListenerStop();
-    if (transactionIntervalId) clearInterval(transactionIntervalId);
-    if (candleIntervalId) clearInterval(candleIntervalId);
-
-    console.log("Simulation finished.");
+    }, "Run Candle Aggregation Interval");
 }
 
-// --- Cleanup ---
-async function cleanup(databases: { candlesDb: any; transactionsDb: any; tickersDb: any; }) {
-    console.log("Closing database connections...");
-    databases.candlesDb.close();
-    databases.transactionsDb.close();
-    databases.tickersDb.close();
 
-    console.log(`Cleaning up database directory: ${DB_BASE_PATH}`);
-    try {
-        await rm(DB_BASE_PATH, { recursive: true, force: true });
-        console.log("Cleanup successful.");
-    } catch (error) {
-        console.error(`Error during cleanup:`, error);
-    }
+async function runCandleAggregator(m: MeasureFunction, dbs: ExchangeDatabases): Promise<() => void> {
+    return m(async () => {
+        let lastProcessedTimestamp = Date.now() - CANDLE_INTERVAL_MS; // Start by looking slightly back
+
+        const intervalId = setInterval(async () => {
+            // Use top-level measure for the interval action
+             try {
+                 const newLastTimestamp = await measure(
+                     (m2) => aggregateCandleAndBroadcast(m2, dbs, lastProcessedTimestamp),
+                    "Aggregate Candle and Broadcast",
+                    { requestId: SIMULATION_ID, level: 1 }
+                );
+                lastProcessedTimestamp = newLastTimestamp;
+            } catch (error) {
+                // Error is already logged by measure, just prevent interval crash
+                console.error("[Candle Aggregator Interval] Uncaught error during aggregation:", error);
+            }
+        }, CANDLE_INTERVAL_MS);
+
+        const stop = () => clearInterval(intervalId);
+        return stop;
+    }, "Start Candle Aggregator");
 }
+
+
+async function cleanupDatabases(m: MeasureFunction, databases: ExchangeDatabases | null) {
+    if (!databases) return;
+    await m(async (m2) => {
+        await m2(() => Promise.resolve(databases.candlesDb.close()), "Close Candles DB");
+        await m2(() => Promise.resolve(databases.transactionsDb.close()), "Close Transactions DB");
+        await m2(() => Promise.resolve(databases.tickersDb.close()), "Close Tickers DB");
+
+        await m2(async () => {
+             try {
+                await rm(DB_BASE_PATH, { recursive: true, force: true });
+            } catch (error: any) {
+                 // Log but don't fail the cleanup process entirely if dir removal fails
+                console.warn(`Warn: Failed to remove DB directory ${DB_BASE_PATH}: ${error.message}`)
+            }
+        }, `Remove DB Directory ${DB_BASE_PATH}`);
+    }, "Cleanup Databases");
+}
+
 
 // --- Main Execution ---
 async function main() {
-    let databases: {
-        candlesDb: SatiDatabase<typeof CandleInputSchema, typeof CandleOutputSchema>;
-        transactionsDb: SatiDatabase<typeof TransactionInputSchema, typeof TransactionOutputSchema>;
-        tickersDb: SatiDatabase<typeof TickerInputSchema, typeof TickerOutputSchema>;
-    } | null = null;
+    let databases: ExchangeDatabases | null = null;
+    let stopTransactionSimulator: (() => void) | null = null;
+    let stopCandleAggregator: (() => void) | null = null;
 
-    try {
-        databases = await setupDatabases();
-        await runSimulation(databases.candlesDb, databases.transactionsDb, databases.tickersDb);
-    } catch (error) {
-        console.error("Simulation failed:", error);
-    } finally {
-        if (databases) {
-            await cleanup(databases);
+    await measure(async (m1) => {
+        try {
+            databases = await createExchangeDatabases(m1);
+
+            // Start simulators concurrently
+            [stopTransactionSimulator, stopCandleAggregator] = await Promise.all([
+                 runTransactionSimulator(m1, databases.transactionsDb),
+                 runCandleAggregator(m1, databases)
+            ]);
+
+
+            await m1(() => new Promise(resolve => setTimeout(resolve, SIMULATION_DURATION_MS)),
+                `Run Simulation for ${SIMULATION_DURATION_MS / 1000}s`);
+
+        } finally {
+             await measure(async (m2) => { // Use a new top-level measure for stop/cleanup
+                if (stopTransactionSimulator) {
+                   await m2(() => Promise.resolve(stopTransactionSimulator!()), "Stop Transaction Simulator");
+                }
+                if (stopCandleAggregator) {
+                    await m2(() => Promise.resolve(stopCandleAggregator!()), "Stop Candle Aggregator");
+                }
+                await cleanupDatabases(m2, databases);
+            }, "Shutdown Simulation", { requestId: SIMULATION_ID });
         }
-        process.exit(0); // Exit cleanly
-    }
+    }, "Exchange Simulation", { requestId: SIMULATION_ID }); // Assign simulation ID
 }
 
-// Run the main function if this script is executed directly
-if (require.main === module) {
-    main();
-}
+// Execute main
+main().catch(error => {
+    console.error("Simulation exited with fatal error:", error);
+    process.exit(1);
+});
 
-// Export elements needed for testing
+// Export elements potentially needed for testing (adjust as necessary)
 export {
     CandleInputSchema, CandleOutputSchema,
     TransactionInputSchema, TransactionOutputSchema,
     TickerInputSchema, TickerOutputSchema,
-    setupDatabases, // To reuse DB setup in tests
-    cleanup,        // To reuse cleanup in tests
-    runSimulation,  // Potentially test the whole flow
+    createExchangeDatabases, // Potentially useful for test setup
+    cleanupDatabases,        // Potentially useful for test teardown
     TICKER_SYMBOL,
     CANDLE_INTERVAL_MS,
     TRANSACTION_INTERVAL_MS,
-    DB_BASE_PATH as SIMULATION_DB_BASE_PATH // Export the path used by the sim
+    DB_BASE_PATH as SIMULATION_DB_BASE_PATH
 };

@@ -41,41 +41,58 @@ export const verboseLog = (category: string, action: string, details?: any) => {
   }
 };
 
+export type MeasureContext = {
+  requestId?: string;
+  level?: number;
+  parentAction?: string;
+};
+
+export type MeasureFunction = <T>(
+    fn: (measure: MeasureFunction) => Promise<T>,
+    action: string,
+) => Promise<T>;
+
 
 export async function measure<T>(
-  fn: (measure: typeof measure) => Promise<T>,
+  fn: (measure: MeasureFunction) => Promise<T>,
   action: string,
   context: MeasureContext = {}
 ): Promise<T> {
   const start = performance.now();
   const level = context.level || 0;
-  let indent = "=".repeat(level);
   const requestId = context.requestId;
-  let logPrefix = requestId ? `[${requestId}] ${indent}>` : `${indent}>`;
+  const parentInfo = context.parentAction ? ` (parent: ${context.parentAction})` : '';
+
+  // Log start
+  let startIndent = "  ".repeat(level);
+  let startPrefix = requestId ? `[${requestId}] ${startIndent}┌─` : `${startIndent}┌─`;
+  console.log(`${startPrefix} ${action}${parentInfo}...`);
 
   try {
-    // Log the start of the action with "..."
-    indent = ">".repeat(level);
-    logPrefix = requestId ? `[${requestId}] ${indent}$` : `${indent}$`;
-    console.log(`${logPrefix} ${action}...`);
-    
-    const result = await fn((nestedFn, nestedAction) =>
+    const nestedMeasure: MeasureFunction = (nestedFn, nestedAction) =>
       measure(nestedFn, nestedAction, {
-        requestId: requestId ? `${requestId}` : undefined,
+        requestId: requestId, // Pass down the same requestId
         level: level + 1,
         parentAction: action
-      })
-    );
-    
+      });
+
+    const result = await fn(nestedMeasure);
+
     const duration = performance.now() - start;
-    indent = "<".repeat(level);
-    logPrefix = requestId ? `[${requestId}] ${indent}$` : `${indent}$`;
-    console.log(`${logPrefix} ${action} ✓ ${duration.toFixed(2)}ms`);
+    // Log success
+    let endIndent = "  ".repeat(level);
+    let endPrefix = requestId ? `[${requestId}] ${endIndent}└─` : `${endIndent}└─`;
+    console.log(`${endPrefix} ${action} ✓ (${duration.toFixed(2)}ms)`);
     return result;
-  } catch (error) {
+  } catch (error: any) {
     const duration = performance.now() - start;
-    // Log failure with "✗", duration, and error
-    console.log(`${logPrefix} ${action} ✗ ${duration.toFixed(2)}ms`, error);
-    throw new Error(`${action} failed: ${error}`);
+    // Log failure
+    let errorIndent = "  ".repeat(level);
+    let errorPrefix = requestId ? `[${requestId}] ${errorIndent}└─` : `${errorIndent}└─`;
+    console.error(`${errorPrefix} ${action} ✗ (${duration.toFixed(2)}ms) Error: ${error.message}`);
+    // Rethrow preserving stack trace if possible, otherwise wrap
+    // throw error instanceof Error ? error : new Error(`${action} failed: ${error}`);
+    // Let's wrap it consistently for clarity in this context
+    throw new Error(`${action} failed: ${error.message || error}`);
   }
 }

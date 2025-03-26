@@ -97,6 +97,7 @@ export function createDatabase<I extends z.ZodObject<any>, O extends z.ZodObject
 
     // Create database connection
     const db = new Database(finalDbPath);
+    console.log('===> database.ts:100 ~ db', db);
     let initialized = false;
 
     // Create event emitter for change notifications
@@ -685,6 +686,7 @@ function sanitizeName(name: string): string {
 }
 
 async function ensureDirExists(dir: string) {
+    console.log('===> database.ts:688 ~ dir', dir);
     try {
         await mkdir(dir, { recursive: true });
     } catch (error) {
