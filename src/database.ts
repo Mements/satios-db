@@ -23,6 +23,13 @@ export interface ChangeEvent<I, O> {
 // Range filter type for find
 export type RangeFilter<T> = [T, T];
 
+export interface ListenOptions {
+    /** How often to poll the database for changes (milliseconds). Defaults to 1000ms. */
+    pollIntervalMs?: number;
+    /** The change ID to start listening from. Defaults to processing only new changes after listener starts. */
+    startFromId?: number;
+}
+
 export interface SatiDatabase<I extends z.ZodObject<any>, O extends z.ZodObject<any>> {
     init: () => Promise<void>;
     insert: (input: z.infer<I>, output?: z.infer<O>) => Promise<{ id: string }>;
@@ -33,7 +40,16 @@ export interface SatiDatabase<I extends z.ZodObject<any>, O extends z.ZodObject<
     update: (input: Partial<z.infer<I>>, output: Partial<z.infer<O>>) => Promise<{ id: string }>;
     delete: (input: Partial<z.infer<I>>) => Promise<{ id: string }>;
     query: <T = any>(sql: string, ...params: any[]) => Promise<T[]>;
-    listen: (callback: (event: ChangeEvent<z.infer<I>, z.infer<O>>) => void) => { stop: () => void };
+    /**
+     * Listen for changes to the database records. Each call creates an independent poller.
+     * @param callback Function to call when a change event occurs.
+     * @param options Configuration for polling interval and starting point.
+     * @returns An object with a `stop` method to halt this specific listener.
+     */
+    listen: (
+        callback: (event: ChangeEvent<z.infer<I>, z.infer<O>>) => void,
+        options?: ListenOptions
+    ) => { stop: () => void };
     getInputSchema: () => I;
     getOutputSchema: () => O;
     getName: () => string;
@@ -49,7 +65,8 @@ export function createDatabase<I extends z.ZodObject<any>, O extends z.ZodObject
     const sanitizedName = sanitizeName(baseName);
     const inputTable = `input_${sanitizedName}`;
     const outputTable = `output_${sanitizedName}`;
-
+    const changesTable = `_${sanitizedName}_changes`;
+    
     const dir = path.dirname(dbPath);
     try {
         fs.mkdirSync(dir, { recursive: true });
@@ -62,51 +79,52 @@ export function createDatabase<I extends z.ZodObject<any>, O extends z.ZodObject
 
     const db = new Database(dbPath);
     let initialized = false;
-    const eventEmitter = new EventEmitter();
 
     const setupTriggers = () => {
+        // Note: These operations are idempotent due to "IF NOT EXISTS"
         db.query(`
-      CREATE TABLE IF NOT EXISTS _${sanitizedName}_changes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        record_id TEXT NOT NULL,
-        change_type TEXT NOT NULL,
-        table_name TEXT NOT NULL,
-        changed_at INTEGER NOT NULL
-      )
-    `).run();
+          CREATE TABLE IF NOT EXISTS ${changesTable} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id TEXT NOT NULL,
+            change_type TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            changed_at INTEGER NOT NULL
+          )
+        `).run();
         db.query(`
-      CREATE TRIGGER IF NOT EXISTS ${inputTable}_insert_trigger
-      AFTER INSERT ON ${inputTable}
-      BEGIN
-        INSERT INTO _${sanitizedName}_changes (record_id, change_type, table_name, changed_at)
-        VALUES (NEW.id, 'input_added', '${inputTable}', unixepoch());
-      END;
-    `).run();
+          CREATE TRIGGER IF NOT EXISTS ${inputTable}_insert_trigger
+          AFTER INSERT ON ${inputTable}
+          BEGIN
+            INSERT INTO ${changesTable} (record_id, change_type, table_name, changed_at)
+            VALUES (NEW.id, 'input_added', '${inputTable}', unixepoch());
+          END;
+        `).run();
         db.query(`
-      CREATE TRIGGER IF NOT EXISTS ${inputTable}_delete_trigger
-      AFTER DELETE ON ${inputTable}
-      BEGIN
-        INSERT INTO _${sanitizedName}_changes (record_id, change_type, table_name, changed_at)
-        VALUES (OLD.id, 'record_deleted', '${inputTable}', unixepoch());
-      END;
-    `).run();
+          CREATE TRIGGER IF NOT EXISTS ${inputTable}_delete_trigger
+          AFTER DELETE ON ${inputTable}
+          BEGIN
+            INSERT INTO ${changesTable} (record_id, change_type, table_name, changed_at)
+            VALUES (OLD.id, 'record_deleted', '${inputTable}', unixepoch());
+          END;
+        `).run();
         db.query(`
-      CREATE TRIGGER IF NOT EXISTS ${outputTable}_insert_trigger
-      AFTER INSERT ON ${outputTable}
-      BEGIN
-        INSERT INTO _${sanitizedName}_changes (record_id, change_type, table_name, changed_at)
-        VALUES (NEW.id, 'output_added', '${outputTable}', unixepoch());
-      END;
-    `).run();
+          CREATE TRIGGER IF NOT EXISTS ${outputTable}_insert_trigger
+          AFTER INSERT ON ${outputTable}
+          BEGIN
+            INSERT INTO ${changesTable} (record_id, change_type, table_name, changed_at)
+            VALUES (NEW.id, 'output_added', '${outputTable}', unixepoch());
+          END;
+        `).run();
         db.query(`
-      CREATE TRIGGER IF NOT EXISTS ${outputTable}_update_trigger
-      AFTER UPDATE ON ${outputTable}
-      BEGIN
-        INSERT INTO _${sanitizedName}_changes (record_id, change_type, table_name, changed_at)
-        VALUES (NEW.id, 'record_updated', '${outputTable}', unixepoch());
-      END;
-    `).run();
+          CREATE TRIGGER IF NOT EXISTS ${outputTable}_update_trigger
+          AFTER UPDATE ON ${outputTable}
+          BEGIN
+            INSERT INTO ${changesTable} (record_id, change_type, table_name, changed_at)
+            VALUES (NEW.id, 'record_updated', '${outputTable}', unixepoch());
+          END;
+        `).run();
     };
+
 
     let lastChangeId = 0;
 
@@ -414,21 +432,94 @@ export function createDatabase<I extends z.ZodObject<any>, O extends z.ZodObject
             return db.query<T>(sql).all(...params);
         },
 
-        listen(callback: (event: ChangeEvent<z.infer<I>, z.infer<O>>) => void): { stop: () => void } {
-            if (!initialized) {
-                this.init().catch(error => {
-                    console.error(`[Database Listener ${baseName}] Error initializing database for listener:`, error);
-                });
-            }
-            eventEmitter.on('change', callback);
-            const lastChangeRecord = db.query(`SELECT MAX(id) as id FROM _${sanitizedName}_changes`).get();
-            lastChangeId = lastChangeRecord?.id || 0;
-            const intervalId = setInterval(pollChanges, 500);
+        listen(
+            callback: (event: ChangeEvent<z.infer<I>, z.infer<O>>) => void,
+            options?: ListenOptions
+        ): { stop: () => void } {
+            const listenerId = Math.random().toString(36).substring(2, 8); // Simple ID for logging
+            const pollIntervalMs = options?.pollIntervalMs ?? 1000; // Default to 1s
+            let listenerLastChangeId: number = -1; // Initialize for this specific listener
+            let intervalId: Timer | null = null;
 
+            // Define the polling function specific to this listener's state
+            const pollChangesForListener = async () => {
+                try {
+                    const changes = db.query(`
+                        SELECT * FROM ${changesTable}
+                        WHERE id > ?
+                        ORDER BY id ASC
+                        LIMIT 100 -- Add a limit to prevent huge batches
+                    `).all(listenerLastChangeId);
+
+                    if (changes.length === 0) return;
+
+                    // Update the watermark *for this listener*
+                    listenerLastChangeId = changes[changes.length - 1].id;
+
+                    for (const change of changes) {
+                        try {
+                            // Fetch the full record (input/output) based on the change
+                            // Avoid fetching record for 'deleted' if not needed by callback? For now, fetch always.
+                            const record = change.change_type !== 'record_deleted'
+                                ? await getRecordById(change.record_id)
+                                : null; // Don't fetch if deleted
+
+                            let eventType: ChangeEvent<any, any>['type'] | null = null;
+                            switch (change.change_type) {
+                                case 'input_added': eventType = 'input_added'; break;
+                                case 'output_added': eventType = 'output_added'; break;
+                                case 'record_updated': eventType = 'record_updated'; break;
+                                case 'record_deleted': eventType = 'record_deleted'; break;
+                            }
+
+                            if (eventType) {
+                                // Call the specific callback provided to this listen() call
+                                callback({
+                                    type: eventType,
+                                    id: change.record_id,
+                                    input: record?.input,
+                                    output: record?.output,
+                                    // previousInput/Output could be added by querying before update/delete triggers, more complex
+                                });
+                            }
+                        } catch (processError) {
+                             console.error(`[DB Listener ${baseName}-${listenerId}] Error processing change ID ${change.id}:`, processError);
+                             // Continue processing next change
+                        }
+                    }
+                } catch (pollError) {
+                    console.error(`[DB Listener ${baseName}-${listenerId}] Error polling changes table:`, pollError);
+                    // Optionally stop polling on certain errors?
+                }
+            };
+
+            // Ensure DB is initialized (incl. triggers) before starting polling
+            this.init().then(() => {
+                 // Determine starting point after init ensures tables exist
+                 if (options?.startFromId !== undefined) {
+                     listenerLastChangeId = options.startFromId;
+                 } else {
+                     // Default: Start from the latest existing change ID, process only future changes
+                     const lastChangeRecord = db.query(`SELECT MAX(id) as id FROM ${changesTable}`).get();
+                     listenerLastChangeId = lastChangeRecord?.id || 0;
+                 }
+                 console.log(`[DB Listener ${baseName}-${listenerId}] Starting poll (every ${pollIntervalMs}ms) from change ID ${listenerLastChangeId}`);
+                 intervalId = setInterval(pollChangesForListener, pollIntervalMs);
+                 // Run once immediately? Optional, depends if you want instant check on listen start
+                 // pollChangesForListener();
+            }).catch(initError => {
+                console.error(`[DB Listener ${baseName}-${listenerId}] Failed to initialize database for listener:`, initError);
+                // Listener won't start
+            });
+
+            // Return the stop function for this specific listener
             return {
                 stop: () => {
-                    clearInterval(intervalId);
-                    eventEmitter.off('change', callback);
+                    if (intervalId) {
+                        clearInterval(intervalId);
+                        intervalId = null; // Mark as stopped
+                        console.log(`[DB Listener ${baseName}-${listenerId}] Polling stopped.`);
+                    }
                 }
             };
         },
