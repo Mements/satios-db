@@ -47,7 +47,7 @@ export interface SatiDatabase<I extends z.ZodObject<any>, O extends z.ZodObject<
      * @returns An object with a `stop` method to halt this specific listener.
      */
     listen: (
-        callback: (event: ChangeEvent<z.infer<I>, z.infer<O>>) => void,
+        callback: (event: ChangeEvent<z.infer<I>, z.infer<O>>) => Promise<void>,
         options?: ListenOptions
     ) => { stop: () => void };
     getInputSchema: () => I;
