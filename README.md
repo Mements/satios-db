@@ -27,11 +27,11 @@ The fundamental innovation in `@satios/db` is its separation of data into two di
 
 ```mermaid
 graph LR
-    A[Input Data { url: "...", etc. }] --> B(Hash Function);
+    A[Input Data] --> B(Hash Function);
     B --> C(Deterministic Record ID);
     C --> D[SQLite Record];
     A -.-> D;
-    E[Output Data { html: "...", status: "done" }] -.-> D;
+    E[Output Data] -.-> D;
 
     style A fill:#cde,stroke:#333,stroke-width:2px;
     style E fill:#ebc,stroke:#333,stroke-width:2px;
