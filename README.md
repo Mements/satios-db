@@ -1,222 +1,63 @@
-# @satios/db
+# Sati-DB: SQLite Data Modeling & Inter-Process Communication
 
-[![npm version](https://badge.fury.io/js/%40satios%2Fdb.svg)](https://badge.fury.io/js/%40satios%2Fdb)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-<!-- Add other relevant badges: Downloads, Build Status, etc. -->
+**Sati-DB** provides a structured approach to using SQLite databases for both data modeling and as a foundation for inter-process communication (IPC) or asynchronous workflows. It consists of two main parts:
 
-**A simple, powerful database library designed for data pipelines and AI agents, built on SQLite.**
+1.  **`database.ts` (Core Layer):** A robust library for managing data using a specific, optimized two-table pattern (input/output).
+2.  **`agent.ts` (Optional Workflow Layer):** Builds upon the core layer to enable asynchronous request/response patterns between processes using the database as a mediator.
 
-`@satios/db` provides a unique approach to data persistence by cleanly separating the **Input** (the immutable definition of *what* something is) from the **Output** (the mutable results or state *associated* with it). This design makes it exceptionally well-suited for tracking progress in pipelines, managing agent states, caching, and more, all with type safety provided by Zod.
+This README focuses primarily on the design philosophy and advantages of the core `database.ts` layer's structure.
 
-## Core Design: The Input/Output Split
+## Core Database Pattern (`database.ts`)
 
-The fundamental innovation in `@satios/db` is its separation of data into two distinct, linked schemas:
+The foundation of Sati-DB is a deliberate two-table structure designed for clarity, efficient querying based on input criteria, and handling potentially asynchronous or optional associated data. For each logical entity (e.g., 'tweets', 'thoughts'), two tables are created:
 
-1.  **Input Schema:** Defines the immutable, essential properties of a record. Think of this as the "natural key" or the definition of the task/entity. Examples:
-    *   A specific URL for a web scraper.
-    *   A unique message ID for a message queue processor.
-    *   A user's prompt and context for an AI agent.
-    *   **Crucially, the Input data is used to generate a deterministic, unique ID for the record.**
+* **`input_<table>` (e.g., `input_tweets`)**:
+    * Stores the primary, defining data – the "input" or "key" information.
+    * **Designed for Filtering:** The columns in this table directly correspond to your input schema fields and are intended to be used as filter criteria in queries (`findRaw`, `query`).
+    * **Automatic Indexing:** The library automatically creates indexes on the columns of the `input_<table>` (specifically non-TEXT columns by default). This significantly optimizes lookup performance when you query records based on specific input field values.
+    * Contains the primary key `id`, which is a deterministic hash generated from the *entire* input object content.
 
-2.  **Output Schema:** Defines the mutable data associated with the Input. This holds the results, computed values, status, or state that might change over time. Examples:
-    *   The scraped HTML content and status (`'pending'`, `'done'`, `'error'`).
-    *   The processed data derived from a message and its processing state.
-    *   The AI agent's generated response, intermediate thoughts, or execution status.
+* **`output_<table>` (e.g., `output_tweets`)**:
+    * Stores data that is *derived from* or *associated with* a specific input record (e.g., calculation results, generated text, status, metadata). Think of it as auxiliary data linked to the primary input.
+    * Uses the *same* `id` as its primary key, establishing a strict **one-to-one relationship** with a corresponding record in the `input_<table>`.
+    * Includes a foreign key constraint back to the `input_<table>` with `ON DELETE CASCADE`.
+    * **Write-Once Enforcement:** The library ensures (via `INSERT OR IGNORE`) that once an output record is written for a given `id`, it cannot be accidentally overwritten by subsequent `insert` calls. Updates must use the specific `updateOutput` method, which itself fails if output already exists.
 
-### How it Works:
+* **`_sati_metadata_<table>`**: Stores metadata about the database, including a representation of the input/output schemas used during initialization.
+* **`_changes_<table>`**: Records all inserts/updates/deletes, enabling the optional `agent.ts` layer to poll for changes.
 
-```mermaid
-graph LR
-    A[Input Data] --> B(Hash Function);
-    B --> C(Deterministic Record ID);
-    C --> D[SQLite Record];
-    A -.-> D;
-    E[Output Data] -.-> D;
+## Advantages of the Two-Table Structure
 
-    style A fill:#cde,stroke:#333,stroke-width:2px;
-    style E fill:#ebc,stroke:#333,stroke-width:2px;
-    style C fill:#dec,stroke:#333,stroke-width:2px;
-    style D fill:#eee,stroke:#666,stroke-width:1px,stroke-dasharray: 5 5;
-```
+While storing everything in a single table is possible, the Sati-DB two-table approach offers distinct advantages:
 
-1.  When you `insert` data, you provide `input` and optionally `output`.
-2.  The library calculates a unique `id` by hashing the `input` data.
-3.  The `input` data (along with the `id`) is stored in an `input_*` table.
-4.  If provided, the `output` data (along with the `id`) is stored in an `output_*` table.
-5.  **Key Benefit:** If you later `insert` data with the *exact same* `input`, the library recognizes the existing `id` and automatically **updates** the `output` data instead of creating a duplicate. This makes inserts behave like "upserts" naturally.
-6.  `find({ completeInput })` becomes an extremely fast lookup based on the generated ID.
+1.  **Conceptual Clarity:** It enforces a clear separation between the primary data used for identification and filtering (input) and the associated results or metadata (output). This improves understanding of the data model.
 
-## Why `@satios/db`? Use Cases
+2.  **Optimized Input-Based Queries:** By automatically indexing the `input_<table>` columns, the database is inherently optimized for efficiently finding records based on your input criteria using `findRaw` or custom `query` calls. In a single, wide table, you would need to manually ensure appropriate indexes are created on the input-related columns, and those indexes might be larger and potentially less performant due to the table's overall size.
 
-This Input/Output model provides significant advantages in various scenarios:
+3.  **Focused Indexing:** Indexes on the `input_<table>` are smaller and contain only the filterable input data, leading to potentially faster lookups compared to indexing the same fields within a larger, combined table containing both input and output data.
 
-### 1. Data Processing Pipelines
+4.  **Efficient Handling of Optional/Asynchronous Output:** If the output data isn't always available immediately when the input is created (a common scenario in async workflows or caching), this structure avoids needing nullable columns for all output fields in the primary data table. The `output_<table>` only stores rows for inputs that *actually have* an output, keeping the `input_<table>` lean and preventing sparse rows. The `LEFT JOIN` used in `findRaw` naturally handles cases where input exists but output doesn't.
 
-Track the state of items moving through a pipeline effortlessly.
+5.  **Clear Data Roles:** It reinforces the idea that the `id` (and therefore the record's identity) is solely determined by the `input` data. The `output` is auxiliary information linked *to* that specific input.
 
-| Pipeline Task        | Example Input Schema             | Example Output Schema                        | Benefit                                           |
-| :------------------- | :------------------------------- | :------------------------------------------- | :------------------------------------------------ |
-| Web Scraping         | `{ url: string }`                | `{ html?: string, status: StateEnum }`       | Easily track/update scrape status per URL.        |
-| Message Processing   | `{ queue: string, msgId: string }` | `{ processedData?: object, state: StateEnum }` | Idempotent processing, track message state.       |
-| Video Transcoding    | `{ sourcePath: string }`         | `{ targetPath?: string, error?: string }`    | Store results linked directly to the source file. |
-| Batch Data Enrichment | `{ recordId: number }`           | `{ enrichedFields?: object, status: string }` | Update status/results based on the input ID.    |
+## Schema Versioning
 
-### 2. AI Agents & LLM Applications
+To prevent runtime errors caused by application code using different schemas than what the database was created with, the `init()` function performs a schema check:
+* On first initialization, it stores a representation of the input and output Zod schema shapes in the `_sati_metadata_<table>`.
+* On subsequent initializations, it compares the provided schemas against the stored representation. If they differ, `init()` throws an error, ensuring schema consistency.
 
-Manage the state, memory, and tool usage of AI agents intuitively.
+## Agent Layer (`agent.ts` - Optional)
 
-| Agent Task          | Example Input Schema                     | Example Output Schema                                  | Benefit                                                              |
-| :------------------ | :--------------------------------------- | :----------------------------------------------------- | :------------------------------------------------------------------- |
-| Answering Questions | `{ query: string, context?: string }`  | `{ answer?: string, sources?: string[], cost?: number }` | Cache answers for identical queries, track generation results.        |
-| Tool Usage          | `{ toolName: string, argsJson: string }` | `{ result?: any, status: StateEnum, error?: string }`  | Track tool call execution status and results based on the call sig. |
-| Multi-step Planning | `{ goal: string }`                       | `{ plan?: Step[], currentStep?: number, state: StateEnum }` | Persist and update agent's plan/progress for a given goal.          |
-| Agent Memory        | `{ conversationId: string, turn: number }` | `{ summary?: string, embedding?: number[] }`            | Store derived information (summary, embedding) per conversation turn. |
+Built upon this robust database structure, the optional `agent.ts` library provides `useAgent`, which implements an asynchronous request/response workflow. It uses the `_changes_<table>` and polling to allow one process to `await agent.request(input)` while another process uses `agent.handle(async (input, setOutput) => ...)` to listen for inputs and provide outputs via the `setOutput` callback. This layer directly benefits from the clear input/output separation and ID correlation provided by `database.ts`.
 
-### 3. Caching
+## Use Cases & Considerations
 
-A natural fit for key-value caching where the key (Input) is derived from complex data.
+*(This section would remain largely the same as in the previous README, outlining suitable scenarios like local IPC, background jobs, simple AI pipelines, etc., and mentioning considerations like polling latency and SQLite write limitations.)*
 
-*   **Input:** Parameters defining the cache entry (e.g., `{ userId: string, queryParams: string }`).
-*   **Output:** The cached result (e.g., `{ data: object, expiresAt: number }`).
+## Setup & Usage
 
-### 4. General State Management
+*(This section would also remain similar, outlining dependency installation and basic usage patterns for `useDatabase` and potentially `useAgent`.)*
 
-Anywhere you need to associate mutable state with an identifier derived from unchanging characteristics.
+---
 
-## Features
-
-*   **Input/Output Split:** Core architectural design.
-*   **Deterministic IDs:** Automatically generated from Input data for efficient lookups and implicit upserts.
-*   **Schema Enforcement:** Uses [Zod](https://zod.dev/) for robust type validation on insert, update, and find.
-*   **Automatic Upserts:** `insert()` naturally handles creating or updating based on Input.
-*   **Built-in Change Listener:** `listen()` provides notifications for `input_added`, `output_added`, `record_updated`, `record_deleted`.
-*   **Simple & Predictable API:** `insert`, `find`, `update`, `delete`, `listen`, `query`.
-*   **SQLite Backend:** Reliable, file-based, zero-config setup. Great for embedded use cases.
-*   **Range Queries:** `find()` supports tuple syntax `[min, max]` for range filtering (e.g., on timestamps).
-*   **Automatic Indexing:** Indexes are automatically created for all fields in the Input table for fast filtering.
-*   **Basic Schema Migration:** Adding new columns to schemas is detected and handled via `ALTER TABLE` on initialization.
-
-## Installation
-
-```bash
-# Using npm
-npm install @satios/db zod
-
-# Using yarn
-yarn add @satios/db zod
-
-# Using bun
-bun add @satios/db zod
-```
-
-## Basic Usage
-
-```typescript
-import { z } from 'zod';
-import { createDatabase } from '@satios/db';
-import path from 'path';
-import os from 'os';
-
-// 1. Define Schemas
-const RequestInputSchema = z.object({
-  userId: z.string(),
-  endpoint: z.string().startsWith('/'),
-});
-
-const RequestOutputSchema = z.object({
-  status: z.enum(['pending', 'completed', 'failed']),
-  resultData: z.record(z.any()).optional(),
-  lastAttempt: z.number().optional(), // Unix timestamp (ms)
-});
-
-// 2. Create Database Instance (uses file path, name derived internally)
-const dbPath = path.join(os.tmpdir(), 'my_app_requests.sqlite');
-const requestDb = createDatabase(RequestInputSchema, RequestOutputSchema, dbPath);
-
-async function runExample() {
-  // Initialize (optional, called automatically if needed)
-  // await requestDb.init();
-
-  // 3. Insert Data (behaves like Upsert)
-  const input1 = { userId: 'user-123', endpoint: '/profile' };
-  const { id: id1 } = await requestDb.insert(input1, { status: 'pending' });
-  console.log(`Inserted/Updated ${input1.endpoint} for ${input1.userId}, ID: ${id1}`);
-
-  // Insert again with same input -> updates output
-  const { id: id1_updated } = await requestDb.insert(input1, {
-    status: 'completed',
-    resultData: { name: 'Alice' },
-    lastAttempt: Date.now(),
-  });
-  console.log(`Updated record ${id1_updated}, Status: completed`);
-
-  // Insert different input
-  const input2 = { userId: 'user-456', endpoint: '/settings' };
-  const { id: id2 } = await requestDb.insert(input2, { status: 'pending' });
-  console.log(`Inserted ${input2.endpoint} for ${input2.userId}, ID: ${id2}`);
-
-  // 4. Find Data
-  // Find by complete input (fastest)
-  const found1 = await requestDb.find(input1);
-  console.log('Found by complete input:', found1[0]?.output?.status); // Output: completed
-
-  // Find by partial input
-  const user1Requests = await requestDb.find({ userId: 'user-123' });
-  console.log(`Found ${user1Requests.length} requests for user-123`); // Output: 1
-
-  // Find by output field
-  const pendingRequests = await requestDb.find(undefined, { status: 'pending' });
-  console.log(`Found ${pendingRequests.length} pending requests`); // Output: 1 (user-456)
-
-  // Find by input range (e.g., timestamp if it were in input)
-  // const recentRequests = await requestDb.find({ timestamp: [Date.now() - 60000, Date.now()] });
-
-  // 5. Listen for Changes
-  console.log('Listening for changes...');
-  const listener = requestDb.listen((event) => {
-    console.log(`[Listener] Event: ${event.type}, ID: ${event.id}`, event.input, event.output);
-    // React to changes, e.g., push updates via WebSocket
-  });
-
-  // Simulate an update to trigger listener
-  await requestDb.update(input2, { status: 'failed', lastAttempt: Date.now() });
-
-  // Wait a moment for listener polling
-  await new Promise(resolve => setTimeout(resolve, 700));
-
-  // 6. Clean up
-  listener.stop();
-  requestDb.close();
-  console.log('Listener stopped, DB closed.');
-}
-
-runExample().catch(console.error);
-```
-
-## API Overview
-
-| Method        | Description                                                                    | Key Features                                |
-| :------------ | :----------------------------------------------------------------------------- | :------------------------------------------ |
-| `init()`      | Initializes DB tables, indexes, triggers. Called automatically if needed.      | Idempotent                                  |
-| `insert(i,o?)`| Inserts a new record or updates output if input already exists (upsert).       | Deterministic ID, Zod validation          |
-| `find(i?,o?)` | Finds records matching filters. Supports partial/full input/output & ranges. | Fast for complete input, Range queries      |
-| `update(i,o)` | Updates output of records matching input. Throws if input yields >1 match.     | Requires specific input match, Zod validation |
-| `delete(i)`   | Deletes records matching input. Throws if input yields >1 match.               | Requires specific input match               |
-| `listen(cb)`  | Subscribes to database changes (`input_added`, `output_added`, etc.).          | Real-time updates (polling), returns `stop()` |
-| `query(sql)`  | Executes raw SQL queries against the underlying SQLite database.               | Power-user escape hatch                     |
-| `close()`     | Closes the database connection.                                                | Releases file handle                      |
-| `getName()` | Returns the base name derived from the database file path.                   | Info                                        |
-| `get*Schema()`| Returns the Zod input/output schema instances.                                 | Introspection                             |
-
-## Advanced Concepts
-
-*   **Range Queries:** Use a tuple `[min, max]` as a value in the `find` filter object to perform a `BETWEEN` query on numeric or date (stored as timestamp) fields. Example: `find({ timestamp: [startTime, endTime] })`.
-*   **Schema Evolution:** If you add a **new, optional** field (or one with a `z.default()`) to your Zod schemas, the library will detect the missing column in the SQLite table upon initialization and automatically run `ALTER TABLE ... ADD COLUMN ...`. Modifying or removing existing fields requires manual migration steps.
-
-## Contributing
-
-Contributions are welcome! Please feel free to open issues or submit pull requests.
-
-## License
-
-[MIT](LICENSE)
+This revised structure emphasizes the deliberate design choices behind the two-table pattern in `database.ts` and why it can be advantageous for specific use cases compared to a single-table model, particularly regarding querying, indexing, and managing associated data.
