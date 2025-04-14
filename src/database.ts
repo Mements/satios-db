@@ -107,6 +107,14 @@ export interface SatiDbCore<I extends z.ZodObject<any>, O extends z.ZodObject<an
     /** Initializes the database: creates tables, indexes, triggers, and verifies schemas. Must be called before other methods. */
     init: () => Promise<void>;
     /**
+     * Inserts or updates a record. Ensures input exists. Inserts or replaces the output.
+     * Ideal for storing latest state associated with an input (e.g., latest price).
+     * @param input The input data object.
+     * @param output The output data object to insert or replace.
+     * @returns Promise resolving to an object containing the record `id`.
+     */
+    upsert: (input: z.infer<I>, output: z.infer<O>) => Promise<{ id: string }>; // <-- New Method
+    /**
      * Inserts an input record and optionally an output record.
      * If input exists, does nothing for input.
      * If output is provided and an output for this ID already exists, it's ignored (write-once).
@@ -420,19 +428,25 @@ export function useDatabase<I extends z.ZodObject<any>, O extends z.ZodObject<an
         },
 
         async insert(input: z.infer<I>, output?: z.infer<O>): Promise<{ id: string, output_ignored?: boolean }> {
+            console.log("output", output)
+            console.log("input", input)
             if (!initialized) await coreApi.init();
             const validatedInput = inputSchema.parse(input);
             const id = generateRecordId(validatedInput, inputSchema);
+            console.log("id", id)
             let validatedOutput: z.infer<O> | undefined = undefined;
             if (output) validatedOutput = outputSchema.parse(output);
+            console.log("validatedOutput", validatedOutput)
             let output_ignored = false;
 
             db.transaction(() => {
                 const processedInput = processObjectForStorage(validatedInput, inputSchema);
+                console.log("processedInput", processedInput)
                 const inputColumns = Object.keys(processedInput);
                 const inputPlaceholders = inputColumns.map(() => "?").join(", ");
-                db.query(`INSERT INTO ${tableNames.inputTable} (id, ${inputColumns.join(", ")}) VALUES (?, ${inputPlaceholders}) ON CONFLICT(id) DO NOTHING`)
+                const res = db.query(`INSERT INTO ${tableNames.inputTable} (id, ${inputColumns.join(", ")}) VALUES (?, ${inputPlaceholders}) ON CONFLICT(id) DO NOTHING`)
                   .run(id, ...Object.values(processedInput));
+                  console.log("res", res)
 
                 if (validatedOutput) {
                     const processedOutput = processObjectForStorage(validatedOutput, outputSchema);
@@ -464,7 +478,8 @@ export function useDatabase<I extends z.ZodObject<any>, O extends z.ZodObject<an
 
         async findByIdRaw(id: string): Promise<RawDatabaseRecord | null> {
             if (!initialized) await coreApi.init();
-            const row = db.query(`SELECT i.*, o.* FROM ${tableNames.inputTable} i LEFT JOIN ${tableNames.outputTable} o ON i.id = o.id WHERE i.id = ?`).get(id);
+            const row = db.query(`SELECT  i.*, o.*, i.id as id FROM ${tableNames.inputTable} i LEFT JOIN ${tableNames.outputTable} o ON i.id = o.id WHERE i.id = ?`).get(id);
+            console.log("row", row)
             return mapRowToRawRecord(row);
         },
 
