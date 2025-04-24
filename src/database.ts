@@ -4,6 +4,12 @@ import path from "path";
 import fs from "node:fs";
 import { createHash } from "node:crypto";
 
+// Type for measure function (same as in tryHelius.ts)
+type MeasureFunction = <T>(fn: () => Promise<T>, label: string) => Promise<T>;
+
+// Default no-op measure function
+const defaultMeasure: MeasureFunction = async <T>(fn: () => Promise<T>) => await fn();
+
 // Reserved SQLite words
 const RESERVED_SQLITE_WORDS = new Set([
   "ABORT", "ACTION", "ADD", "AFTER", "ALL", "ALTER", "ALWAYS", "ANALYZE", "AND", "AS", "ASC", "ATTACH", "AUTOINCREMENT",
@@ -36,6 +42,7 @@ export interface TableNames {
   outputTable: string;
   changesTable: string;
   metadataTable: string;
+  schemaTable: string;
 }
 
 // Zod Type Guards
@@ -86,34 +93,13 @@ function sanitizeName(name: string): string {
   return sanitized;
 }
 
-// Core Database Interface
-export interface SatiDbCore<I extends z.ZodObject<any>, O extends z.ZodObject<any>> {
-  init: () => Promise<void>;
-  upsert: (input: z.infer<I>, output: z.infer<O>) => Promise<{ id: string }>;
-  insert: (input: z.infer<I>, output?: z.infer<O>) => Promise<{ id: string, output_ignored?: boolean }>;
-  findRaw: (filter?: { input?: Filter<I>, output?: Filter<O> }) => Promise<Array<RawDatabaseRecord>>;
-  findByIdRaw: (id: string) => Promise<RawDatabaseRecord | null>;
-  updateOutput: (input: z.infer<I>, output: Partial<z.infer<O>>) => Promise<{ id: string }>;
-  delete: (input: z.infer<I>) => Promise<{ id: string }>;
-  query: <T = any>(sql: string, ...params: any[]) => Promise<T[]>;
-  getInputSchema: () => I;
-  getOutputSchema: () => O;
-  getName: () => string;
-  close: () => void;
-  _internal: {
-    generateId: (input: z.infer<I>) => string;
-    getDbInstance: () => Database;
-    getTableNames: () => TableNames;
-    isInitialized: () => boolean;
-  };
-}
-
 // SQLite Utility Functions
 function getSqliteType(zodType: z.ZodType): string | null {
   const unwrapped = zodType.unwrap ? zodType.unwrap() : zodType;
   if (isZodString(unwrapped) || isZodEnum(unwrapped) || isZodArray(unwrapped) || isZodObject(unwrapped) || isZodDate(unwrapped)) return "TEXT";
   if (isZodNumber(unwrapped)) return "NUMERIC";
   if (isZodBoolean(unwrapped)) return "INTEGER";
+  if (unwrapped._def.typeName === "ZodBigInt") return "TEXT"; // Handle ZodBigInt
   if (isZodDefault(zodType)) return getSqliteType(zodType._def.innerType);
   console.warn(`Unsupported Zod type: ${zodType._def.typeName}`);
   return "TEXT";
@@ -178,6 +164,7 @@ function processValueForStorage(value: any, zodType: z.ZodType): any {
   if (isZodBoolean(unwrapped)) return value ? 1 : 0;
   if (isZodArray(unwrapped) || isZodObject(unwrapped)) return JSON.stringify(value);
   if (isZodNumber(unwrapped) && typeof value === 'number' && !Number.isFinite(value)) return null;
+  if (unwrapped._def.typeName === "ZodBigInt") return value.toString(); // Handle ZodBigInt
   return value;
 }
 
@@ -199,6 +186,7 @@ function deserializeValue(value: any, zodType: z.ZodType): any {
     if (isZodBoolean(unwrapped)) return Boolean(Number(value));
     if (isZodArray(unwrapped) || isZodObject(unwrapped)) return typeof value === 'string' ? JSON.parse(value) : value;
     if (isZodNumber(unwrapped)) return Number(value);
+    if (unwrapped._def.typeName === "ZodBigInt") return BigInt(value); // Handle ZodBigInt
     if (isZodString(unwrapped) || isZodEnum(unwrapped)) return String(value);
   } catch (e: any) {
     console.error(`Error deserializing value "${value}" type ${unwrapped?._def?.typeName}:`, e?.message);
@@ -207,7 +195,14 @@ function deserializeValue(value: any, zodType: z.ZodType): any {
   return value;
 }
 
-function buildWhereClause(filter: { input?: Filter<any>, output?: Filter<any> } | undefined, params: any[], inputAlias: string = 'i', outputAlias: string = 'o'): string {
+function buildWhereClause(
+  filter: { input?: Filter<any>, output?: Filter<any> } | undefined,
+  params: any[],
+  inputSchema: z.ZodObject<any>,
+  outputSchema: z.ZodObject<any>,
+  inputAlias: string = 'i',
+  outputAlias: string = 'o'
+): string {
   let clauses: string[] = [];
   const addFilters = (dataFilter: Record<string, any> | undefined, schema: z.ZodObject<any>, alias: string) => {
     if (!dataFilter) return;
@@ -224,8 +219,8 @@ function buildWhereClause(filter: { input?: Filter<any>, output?: Filter<any> } 
       }
     }
   };
-  addFilters(filter?.input, filter?.input ? filter.input : z.object({}), inputAlias);
-  addFilters(filter?.output, filter?.output ? filter.output : z.object({}), outputAlias);
+  addFilters(filter?.input, inputSchema, inputAlias);
+  addFilters(filter?.output, outputSchema, outputAlias);
   return clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
 }
 
@@ -258,7 +253,7 @@ function ensureTableColumns(dbInstance: Database, tableName: string, schema: z.Z
   }
 }
 
-const setupTriggers = (db: Database, tableNames: TableNames) => {
+function setupTriggers(db: Database, tableNames: TableNames) {
   if (!db || db.closed) return;
   db.transaction(() => {
     db.query(`CREATE TABLE IF NOT EXISTS ${tableNames.changesTable} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, record_id TEXT NOT NULL, change_type TEXT NOT NULL, table_name TEXT NOT NULL, changed_at INTEGER NOT NULL DEFAULT (unixepoch()))`).run();
@@ -271,9 +266,9 @@ const setupTriggers = (db: Database, tableNames: TableNames) => {
     db.query(`DROP TRIGGER IF EXISTS ${tableNames.outputTable}_update_trigger`).run();
     db.query(`CREATE TRIGGER ${tableNames.outputTable}_update_trigger AFTER UPDATE ON ${tableNames.outputTable} BEGIN INSERT INTO ${tableNames.changesTable} (record_id, change_type, table_name) VALUES (NEW.id, 'record_updated', 'output'); END;`).run();
   })();
-};
+}
 
-const stringifySchemaShape = (schema: z.ZodObject<any>): string => {
+function stringifySchemaShape(schema: z.ZodObject<any>): string {
   const shape = schema.shape;
   const sortedKeys = Object.keys(shape).sort();
   const shapeRepresentation: Record<string, string> = {};
@@ -281,7 +276,29 @@ const stringifySchemaShape = (schema: z.ZodObject<any>): string => {
     shapeRepresentation[key] = shape[key]._def.typeName;
   }
   return JSON.stringify(shapeRepresentation);
-};
+}
+
+// Core Database Interface
+export interface SatiDbCore<I extends z.ZodObject<any>, O extends z.ZodObject<any>> {
+  init: (measureFn?: MeasureFunction) => Promise<void>;
+  upsert: (input: z.infer<I>, output: z.infer<O>, measureFn?: MeasureFunction) => Promise<{ id: string }>;
+  insert: (input: z.infer<I>, output?: z.infer<O>, measureFn?: MeasureFunction) => Promise<{ id: string, output_ignored?: boolean }>;
+  findRaw: (filter?: { input?: Filter<I>, output?: Filter<O> }, measureFn?: MeasureFunction) => Promise<Array<RawDatabaseRecord>>;
+  findByIdRaw: (id: string, measureFn?: MeasureFunction) => Promise<RawDatabaseRecord | null>;
+  updateOutput: (input: z.infer<I>, output: Partial<z.infer<O>>, measureFn?: MeasureFunction) => Promise<{ id: string }>;
+  delete: (input: z.infer<I>, measureFn?: MeasureFunction) => Promise<{ id: string }>;
+  query: <T = any>(sql: string, params: any[], measureFn?: MeasureFunction) => Promise<T[]>;
+  getInputSchema: () => I;
+  getOutputSchema: () => O;
+  getName: () => string;
+  close: () => void;
+  _internal: {
+    generateId: (input: z.infer<I>) => string;
+    getDbInstance: () => Database;
+    getTableNames: () => TableNames;
+    isInitialized: () => boolean;
+  };
+}
 
 // SatiDbCore Implementation
 export function useSatiDbCore<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(
@@ -295,7 +312,8 @@ export function useSatiDbCore<I extends z.ZodObject<any>, O extends z.ZodObject<
     inputTable: `input_${sanitizedName}`,
     outputTable: `output_${sanitizedName}`,
     changesTable: `_changes_${sanitizedName}`,
-    metadataTable: `_sati_metadata_${sanitizedName}`
+    metadataTable: `_sati_metadata_${sanitizedName}`,
+    schemaTable: `_schema_${sanitizedName}`
   };
 
   if ('id' in inputSchema.shape || 'id' in outputSchema.shape) {
@@ -317,256 +335,302 @@ export function useSatiDbCore<I extends z.ZodObject<any>, O extends z.ZodObject<
   }
   let initialized = false;
 
-  const coreApi: SatiDbCore<I, O> = {
-    async init(): Promise<void> {
-      if (initialized || !db || db.closed) return;
-      db.transaction(() => {
-        db.query(createTableSql(inputSchema, tableNames.inputTable, false)).run();
-        db.query(createTableSql(outputSchema, tableNames.outputTable, true)).run();
-        db.query(`CREATE TABLE IF NOT EXISTS ${tableNames.metadataTable} (key TEXT PRIMARY KEY, value TEXT NOT NULL)`).run();
+  async function storeSchemaDescriptions(measureFn: MeasureFunction = defaultMeasure) {
+    await measureFn(async () => {
+      db.query(`
+        CREATE TABLE IF NOT EXISTS ${tableNames.schemaTable} (
+          table_name TEXT NOT NULL,
+          column_name TEXT NOT NULL,
+          column_type TEXT NOT NULL,
+          description TEXT,
+          PRIMARY KEY (table_name, column_name)
+        )
+      `).run();
 
-        const currentInputShapeStr = stringifySchemaShape(inputSchema);
-        const currentOutputShapeStr = stringifySchemaShape(outputSchema);
-        const storedInputShape = db.query<{ value: string }>(`SELECT value FROM ${tableNames.metadataTable} WHERE key = 'input_schema_shape'`).get()?.value;
-        const storedOutputShape = db.query<{ value: string }>(`SELECT value FROM ${tableNames.metadataTable} WHERE key = 'output_schema_shape'`).get()?.value;
-
-        if (storedInputShape === undefined || storedOutputShape === undefined) {
-          console.log(`Storing initial schema shapes.`);
-          db.query(`INSERT OR REPLACE INTO ${tableNames.metadataTable} (key, value) VALUES (?, ?)`).run('input_schema_shape', currentInputShapeStr);
-          db.query(`INSERT OR REPLACE INTO ${tableNames.metadataTable} (key, value) VALUES (?, ?)`).run('output_schema_shape', currentOutputShapeStr);
-        } else {
-          if (storedInputShape !== currentInputShapeStr) throw new Error(`Input schema mismatch. Expected: ${storedInputShape}, Got: ${currentInputShapeStr}`);
-          if (storedOutputShape !== currentOutputShapeStr) throw new Error(`Output schema mismatch. Expected: ${storedOutputShape}, Got: ${currentOutputShapeStr}`);
-          console.log(`Schema shapes verified.`);
+      const storeDescriptions = (schema: z.ZodObject<any>, tableName: string) => {
+        for (const [key, valueDef] of Object.entries(schema.shape)) {
+          const description = valueDef._def.description || null;
+          const columnType = getSqliteType(valueDef) || 'TEXT';
+          db.query(`
+            INSERT OR REPLACE INTO ${tableNames.schemaTable} (table_name, column_name, column_type, description)
+            VALUES (?, ?, ?, ?)
+          `).run(tableName, key, columnType, description);
         }
+      };
 
-        ensureTableColumns(db, tableNames.inputTable, inputSchema, false);
-        ensureTableColumns(db, tableNames.outputTable, outputSchema, true);
-        createAutomaticIndexes(db, tableNames.inputTable, inputSchema).catch(e => console.error(`Error creating input indexes:`, e));
-        createAutomaticIndexes(db, tableNames.outputTable, outputSchema).catch(e => console.error(`Error creating output indexes:`, e));
-        setupTriggers(db, tableNames);
-      })();
-      initialized = true;
-      console.log(`Initialized.`);
+      storeDescriptions(inputSchema, tableNames.inputTable);
+      storeDescriptions(outputSchema, tableNames.outputTable);
+    }, `db_store_schema_${baseName}`);
+  }
+
+  const coreApi: SatiDbCore<I, O> = {
+    async init(measureFn: MeasureFunction = defaultMeasure): Promise<void> {
+      await measureFn(async () => {
+        if (initialized || !db || db.closed) return;
+        db.transaction(() => {
+          db.query(createTableSql(inputSchema, tableNames.inputTable, false)).run();
+          db.query(createTableSql(outputSchema, tableNames.outputTable, true)).run();
+          db.query(`CREATE TABLE IF NOT EXISTS ${tableNames.metadataTable} (key TEXT PRIMARY KEY, value TEXT NOT NULL)`).run();
+
+          const currentInputShapeStr = stringifySchemaShape(inputSchema);
+          const currentOutputShapeStr = stringifySchemaShape(outputSchema);
+          const storedInputShape = db.query<{ value: string }>(`SELECT value FROM ${tableNames.metadataTable} WHERE key = 'input_schema_shape'`).get()?.value;
+          const storedOutputShape = db.query<{ value: string }>(`SELECT value FROM ${tableNames.metadataTable} WHERE key = 'output_schema_shape'`).get()?.value;
+
+          if (storedInputShape === undefined || storedOutputShape === undefined) {
+            db.query(`INSERT OR REPLACE INTO ${tableNames.metadataTable} (key, value) VALUES (?, ?)`).run('input_schema_shape', currentInputShapeStr);
+            db.query(`INSERT OR REPLACE INTO ${tableNames.metadataTable} (key, value) VALUES (?, ?)`).run('output_schema_shape', currentOutputShapeStr);
+          } else {
+            if (storedInputShape !== currentInputShapeStr) throw new Error(`Input schema mismatch. Expected: ${storedInputShape}, Got: ${currentInputShapeStr}`);
+            if (storedOutputShape !== currentOutputShapeStr) throw new Error(`Output schema mismatch. Expected: ${storedOutputShape}, Got: ${currentOutputShapeStr}`);
+          }
+
+          ensureTableColumns(db, tableNames.inputTable, inputSchema, false);
+          ensureTableColumns(db, tableNames.outputTable, outputSchema, true);
+          createAutomaticIndexes(db, tableNames.inputTable, inputSchema).catch(e => console.error(`Error creating input indexes:`, e));
+          createAutomaticIndexes(db, tableNames.outputTable, outputSchema).catch(e => console.error(`Error creating output indexes:`, e));
+          setupTriggers(db, tableNames);
+          storeSchemaDescriptions().catch(e => console.error(`Error storing schema descriptions:`, e));
+        })();
+        initialized = true;
+      }, `db_init_${baseName}`);
     },
 
-    async insert(input: z.infer<I>, output?: z.infer<O>): Promise<{ id: string, output_ignored?: boolean }> {
-      if (!initialized) await coreApi.init();
+    async insert(input: z.infer<I>, output?: z.infer<O>, measureFn: MeasureFunction = defaultMeasure): Promise<{ id: string, output_ignored?: boolean }> {
       const validatedInput = inputSchema.parse(input);
       const id = generateRecordId(validatedInput, inputSchema);
-      let validatedOutput: z.infer<O> | undefined = undefined;
-      if (output !== undefined) {
-        validatedOutput = outputSchema.parse(output);
-      }
-      let output_ignored = false;
-
-      db.transaction(() => {
-        const processedInput = processObjectForStorage(validatedInput, inputSchema);
-        const inputColumns = Object.keys(processedInput);
-        if (inputColumns.length === 0 && Object.keys(validatedInput).length > 0) {
-          console.warn(`Input object for ID ${id} resulted in zero columns for storage.`);
+      return await measureFn(async () => {
+        if (!initialized) await coreApi.init();
+        let validatedOutput: z.infer<O> | undefined = undefined;
+        if (output !== undefined) {
+          validatedOutput = outputSchema.parse(output);
         }
-        const inputPlaceholders = inputColumns.map(() => "?").join(", ");
-        db.query(`INSERT INTO ${tableNames.inputTable} (id${inputColumns.length > 0 ? ", " + inputColumns.join(", ") : ""}) VALUES (?${inputPlaceholders.length > 0 ? ", " + inputPlaceholders : ""}) ON CONFLICT(id) DO NOTHING`)
-          .run(id, ...Object.values(processedInput));
+        let output_ignored = false;
 
-        if (validatedOutput) {
+        db.transaction(() => {
+          const processedInput = processObjectForStorage(validatedInput, inputSchema);
+          const inputColumns = Object.keys(processedInput);
+          if (inputColumns.length === 0 && Object.keys(validatedInput).length > 0) {
+            console.warn(`Input object for ID ${id} resulted in zero columns for storage.`);
+          }
+          const inputPlaceholders = inputColumns.map(() => "?").join(", ");
+          db.query(`INSERT INTO ${tableNames.inputTable} (id${inputColumns.length > 0 ? ", " + inputColumns.join(", ") : ""}) VALUES (?${inputPlaceholders.length > 0 ? ", " + inputPlaceholders : ""}) ON CONFLICT(id) DO NOTHING`)
+            .run(id, ...Object.values(processedInput));
+
+          if (validatedOutput) {
+            const processedOutput = processObjectForStorage(validatedOutput, outputSchema);
+            const outputColumns = Object.keys(processedOutput);
+            if (outputColumns.length > 0) {
+              const outputPlaceholders = outputColumns.map(() => "?").join(", ");
+              const result = db.query(`INSERT OR IGNORE INTO ${tableNames.outputTable} (id, ${outputColumns.join(", ")}) VALUES (?, ${outputPlaceholders})`)
+                .run(id, ...Object.values(processedOutput));
+              if (result.changes === 0) output_ignored = true;
+            } else {
+              console.warn(`Output object for ID ${id} resulted in zero columns for storage.`);
+            }
+          }
+        })();
+
+        if (output_ignored) console.log(`Output ignored for ID ${id} (already exists or no columns to insert).`);
+        return { id, output_ignored };
+      }, `db_insert_${baseName}_${id}`);
+    },
+
+    async upsert(input: z.infer<I>, output: z.infer<O>, measureFn: MeasureFunction = defaultMeasure): Promise<{ id: string }> {
+      const validatedInput = inputSchema.parse(input);
+      const id = generateRecordId(validatedInput, inputSchema);
+      return await measureFn(async () => {
+        if (!initialized) await coreApi.init();
+        const validatedOutput = outputSchema.parse(output);
+
+        db.transaction(() => {
+          const processedInput = processObjectForStorage(validatedInput, inputSchema);
+          const inputColumns = Object.keys(processedInput);
+          const inputPlaceholders = inputColumns.map(() => "?").join(", ");
+          db.query(`INSERT INTO ${tableNames.inputTable} (id${inputColumns.length > 0 ? ", " + inputColumns.join(", ") : ""}) VALUES (?${inputPlaceholders.length > 0 ? ", " + inputPlaceholders : ""}) ON CONFLICT(id) DO NOTHING`)
+            .run(id, ...Object.values(processedInput));
+
           const processedOutput = processObjectForStorage(validatedOutput, outputSchema);
           const outputColumns = Object.keys(processedOutput);
           if (outputColumns.length > 0) {
             const outputPlaceholders = outputColumns.map(() => "?").join(", ");
-            const result = db.query(`INSERT OR IGNORE INTO ${tableNames.outputTable} (id, ${outputColumns.join(", ")}) VALUES (?, ${outputPlaceholders})`)
+            db.query(`INSERT OR REPLACE INTO ${tableNames.outputTable} (id, ${outputColumns.join(", ")}) VALUES (?, ${outputPlaceholders})`)
               .run(id, ...Object.values(processedOutput));
-            if (result.changes === 0) output_ignored = true;
           } else {
-            console.warn(`Output object for ID ${id} resulted in zero columns for storage.`);
+            db.query(`DELETE FROM ${tableNames.outputTable} WHERE id = ?`).run(id);
+            console.warn(`Upsert: Output object for ID ${id} resulted in zero columns; existing output (if any) removed.`);
           }
-        }
-      })();
-
-      if (output_ignored) console.log(`Output ignored for ID ${id} (already exists or no columns to insert).`);
-      return { id, output_ignored };
+        })();
+        return { id };
+      }, `db_upsert_${baseName}_${id}`);
     },
 
-    async upsert(input: z.infer<I>, output: z.infer<O>): Promise<{ id: string }> {
-      if (!initialized) await coreApi.init();
-      const validatedInput = inputSchema.parse(input);
-      const id = generateRecordId(validatedInput, inputSchema);
-      const validatedOutput = outputSchema.parse(output);
+    async findRaw(filter?: { input?: Filter<I>, output?: Filter<O> }, measureFn: MeasureFunction = defaultMeasure): Promise<Array<RawDatabaseRecord>> {
+      return await measureFn(async () => {
+        if (!initialized) await coreApi.init();
+        const params: any[] = [];
+        const inputCols = ['id', ...Object.keys(inputSchema.shape)].map(c => `i."${c}" AS "i_${c}"`).join(', ');
+        const outputCols = Object.keys(outputSchema.shape).map(c => `o."${c}" AS "o_${c}"`).join(', ');
+        let sql = `SELECT ${inputCols}${outputCols ? ', ' + outputCols : ''} FROM ${tableNames.inputTable} i LEFT JOIN ${tableNames.outputTable} o ON i.id = o.id`;
 
-      db.transaction(() => {
-        const processedInput = processObjectForStorage(validatedInput, inputSchema);
-        const inputColumns = Object.keys(processedInput);
-        const inputPlaceholders = inputColumns.map(() => "?").join(", ");
-        db.query(`INSERT INTO ${tableNames.inputTable} (id${inputColumns.length > 0 ? ", " + inputColumns.join(", ") : ""}) VALUES (?${inputPlaceholders.length > 0 ? ", " + inputPlaceholders : ""}) ON CONFLICT(id) DO NOTHING`)
-          .run(id, ...Object.values(processedInput));
+        const whereClause = buildWhereClause(filter, params, inputSchema, outputSchema, 'i', 'o');
+        sql += ` ${whereClause}`;
 
-        const processedOutput = processObjectForStorage(validatedOutput, outputSchema);
-        const outputColumns = Object.keys(processedOutput);
-        if (outputColumns.length > 0) {
-          const outputPlaceholders = outputColumns.map(() => "?").join(", ");
-          db.query(`INSERT OR REPLACE INTO ${tableNames.outputTable} (id, ${outputColumns.join(", ")}) VALUES (?, ${outputPlaceholders})`)
-            .run(id, ...Object.values(processedOutput));
-        } else {
-          db.query(`DELETE FROM ${tableNames.outputTable} WHERE id = ?`).run(id);
-          console.warn(`Upsert: Output object for ID ${id} resulted in zero columns; existing output (if any) removed.`);
+        if (filter?.output && Object.keys(filter.output).length > 0) {
+          sql += (whereClause ? " AND" : " WHERE") + " o.id IS NOT NULL";
         }
-      })();
-      return { id };
-    },
 
-    async findRaw(filter?): Promise<Array<RawDatabaseRecord>> {
-      if (!initialized) await coreApi.init();
-      const params: any[] = [];
-      const inputCols = ['id', ...Object.keys(inputSchema.shape)].map(c => `i."${c}" AS "i_${c}"`).join(', ');
-      const outputCols = Object.keys(outputSchema.shape).map(c => `o."${c}" AS "o_${c}"`).join(', ');
-      let sql = `SELECT ${inputCols}${outputCols ? ', ' + outputCols : ''} FROM ${tableNames.inputTable} i LEFT JOIN ${tableNames.outputTable} o ON i.id = o.id`;
+        const results = db.query(sql).all(...params);
 
-      const whereClause = buildWhereClause(filter, params, 'i', 'o');
-      sql += ` ${whereClause}`;
+        const mapPrefixedRow = (row: any): RawDatabaseRecord | null => {
+          if (!row || typeof row.i_id !== 'string') return null;
+          const inputData: Record<string, any> = {};
+          const outputData: Record<string, any> = {};
+          let hasNonNullOutputDbValue = false;
 
-      if (filter?.output && Object.keys(filter.output).length > 0) {
-        sql += (whereClause ? " AND" : " WHERE") + " o.id IS NOT NULL";
-      }
-
-      const results = db.query(sql).all(...params);
-
-      const mapPrefixedRow = (row: any): RawDatabaseRecord | null => {
-        if (!row || typeof row.i_id !== 'string') return null;
-        const inputData: Record<string, any> = {};
-        const outputData: Record<string, any> = {};
-        let hasNonNullOutputDbValue = false;
-
-        for (const [key, value] of Object.entries(row)) {
-          if (key.startsWith('i_')) {
-            const originalKey = key.substring(2);
-            if (originalKey === 'id') continue;
-            if (inputSchema.shape[originalKey]) {
-              inputData[originalKey] = deserializeValue(value, inputSchema.shape[originalKey]);
-            }
-          } else if (key.startsWith('o_')) {
-            const originalKey = key.substring(2);
-            if (outputSchema.shape[originalKey]) {
-              outputData[originalKey] = deserializeValue(value, outputSchema.shape[originalKey]);
-              if (value !== null) {
-                hasNonNullOutputDbValue = true;
+          for (const [key, value] of Object.entries(row)) {
+            if (key.startsWith('i_')) {
+              const originalKey = key.substring(2);
+              if (originalKey === 'id') continue;
+              if (inputSchema.shape[originalKey]) {
+                inputData[originalKey] = deserializeValue(value, inputSchema.shape[originalKey]);
+              }
+            } else if (key.startsWith('o_')) {
+              const originalKey = key.substring(2);
+              if (outputSchema.shape[originalKey]) {
+                outputData[originalKey] = deserializeValue(value, outputSchema.shape[originalKey]);
+                if (value !== null) {
+                  hasNonNullOutputDbValue = true;
+                }
               }
             }
           }
-        }
-        return {
-          id: row.i_id,
-          input: inputData,
-          ...(hasNonNullOutputDbValue && { output: outputData })
+          return {
+            id: row.i_id,
+            input: inputData,
+            ...(hasNonNullOutputDbValue && { output: outputData })
+          };
         };
-      };
 
-      return results.map(row => mapPrefixedRow(row)).filter(record => record !== null) as Array<RawDatabaseRecord>;
+        return results.map(row => mapPrefixedRow(row)).filter(record => record !== null) as Array<RawDatabaseRecord>;
+      }, `db_find_raw_${baseName}`);
     },
 
-    async findByIdRaw(id: string): Promise<RawDatabaseRecord | null> {
-      if (!initialized) await coreApi.init();
-      const inputCols = ['id', ...Object.keys(inputSchema.shape)].map(c => `i."${c}" AS "i_${c}"`).join(', ');
-      const outputCols = Object.keys(outputSchema.shape).map(c => `o."${c}" AS "o_${c}"`).join(', ');
-      const sql = `SELECT ${inputCols}${outputCols ? ', ' + outputCols : ''} FROM ${tableNames.inputTable} i LEFT JOIN ${tableNames.outputTable} o ON i.id = o.id WHERE i.id = ?`;
-      const row = db.query(sql).get(id);
+    async findByIdRaw(id: string, measureFn: MeasureFunction = defaultMeasure): Promise<RawDatabaseRecord | null> {
+      return await measureFn(async () => {
+        if (!initialized) await coreApi.init();
+        const inputCols = ['id', ...Object.keys(inputSchema.shape)].map(c => `i."${c}" AS "i_${c}"`).join(', ');
+        const outputCols = Object.keys(outputSchema.shape).map(c => `o."${c}" AS "o_${c}"`).join(', ');
+        const sql = `SELECT ${inputCols}${outputCols ? ', ' + outputCols : ''} FROM ${tableNames.inputTable} i LEFT JOIN ${tableNames.outputTable} o ON i.id = o.id WHERE i.id = ?`;
+        const row = db.query(sql).get(id);
 
-      const mapPrefixedRow = (row: any): RawDatabaseRecord | null => {
-        if (!row || typeof row.i_id !== 'string') return null;
-        const inputData: Record<string, any> = {};
-        const outputData: Record<string, any> = {};
-        let hasNonNullOutputDbValue = false;
+        const mapPrefixedRow = (row: any): RawDatabaseRecord | null => {
+          if (!row || typeof row.i_id !== 'string') return null;
+          const inputData: Record<string, any> = {};
+          const outputData: Record<string, any> = {};
+          let hasNonNullOutputDbValue = false;
 
-        for (const [key, value] of Object.entries(row)) {
-          if (key.startsWith('i_')) {
-            const originalKey = key.substring(2);
-            if (originalKey === 'id') continue;
-            if (inputSchema.shape[originalKey]) {
-              inputData[originalKey] = deserializeValue(value, inputSchema.shape[originalKey]);
-            }
-          } else if (key.startsWith('o_')) {
-            const originalKey = key.substring(2);
-            if (outputSchema.shape[originalKey]) {
-              outputData[originalKey] = deserializeValue(value, outputSchema.shape[originalKey]);
-              if (value !== null) hasNonNullOutputDbValue = true;
+          for (const [key, value] of Object.entries(row)) {
+            if (key.startsWith('i_')) {
+              const originalKey = key.substring(2);
+              if (originalKey === 'id') continue;
+              if (inputSchema.shape[originalKey]) {
+                inputData[originalKey] = deserializeValue(value, inputSchema.shape[originalKey]);
+              }
+            } else if (key.startsWith('o_')) {
+              const originalKey = key.substring(2);
+              if (outputSchema.shape[originalKey]) {
+                outputData[originalKey] = deserializeValue(value, outputSchema.shape[originalKey]);
+                if (value !== null) hasNonNullOutputDbValue = true;
+              }
             }
           }
-        }
-        return {
-          id: row.i_id,
-          input: inputData,
-          ...(hasNonNullOutputDbValue && { output: outputData })
+          return {
+            id: row.i_id,
+            input: inputData,
+            ...(hasNonNullOutputDbValue && { output: outputData })
+          };
         };
-      };
 
-      return mapPrefixedRow(row);
+        return mapPrefixedRow(row);
+      }, `db_find_by_id_${baseName}_${id}`);
     },
 
-    async updateOutput(input: z.infer<I>, output: Partial<z.infer<O>>): Promise<{ id: string }> {
-      if (!initialized) await coreApi.init();
-      const validatedInput = inputSchema.parse(input);
-      const id = generateRecordId(validatedInput, inputSchema);
-      const validatedOutputUpdate = outputSchema.partial().parse(output);
-      if (Object.keys(validatedOutputUpdate).length === 0) {
-        console.log(`updateOutput called with empty output object for ID ${id}. No changes made.`);
-        return { id };
-      }
-
-      const inputExists = db.query(`SELECT 1 FROM ${tableNames.inputTable} WHERE id = ?`).get(id);
-      if (!inputExists) {
-        throw new Error(`UpdateOutput failed: Input ID ${id} not found.`);
-      }
-
-      const existingOutputRow = db.query(`SELECT 1 FROM ${tableNames.outputTable} WHERE id = ?`).get(id);
-      if (existingOutputRow) {
-        throw new Error(`UpdateOutput failed: Output already exists for ID ${id}. Use upsert if overwrite is intended.`);
-      }
-
-      let fullOutputData: z.infer<O>;
-      try {
-        fullOutputData = outputSchema.parse(validatedOutputUpdate);
-      } catch (parseError: any) {
-        console.error(`Failed to parse partial output for ID ${id}:`, parseError.errors);
-        throw new Error(`UpdateOutput failed: Provided partial output is insufficient. ${parseError.message}`);
-      }
-
-      const processedOutput = processObjectForStorage(fullOutputData, outputSchema);
-      const columns = Object.keys(processedOutput);
-
-      if (columns.length > 0) {
-        const placeholders = columns.map(() => "?").join(", ");
-        db.query(`INSERT OR IGNORE INTO ${tableNames.outputTable} (id, ${columns.join(", ")}) VALUES (?, ${placeholders})`)
-          .run(id, ...Object.values(processedOutput));
-      } else {
-        console.warn(`updateOutput for ID ${id} resulted in zero columns. No output row inserted.`);
-      }
-      return { id };
-    },
-
-    async delete(input: z.infer<I>): Promise<{ id: string }> {
-      if (!initialized) await coreApi.init();
-      const validatedInput = inputSchema.parse(input);
-      const id = generateRecordId(validatedInput, inputSchema);
-      const result = db.query(`DELETE FROM ${tableNames.inputTable} WHERE id = ?`).run(id);
-      if (result.changes === 0) {
-        throw new Error(`Delete failed: Record ID ${id} not found.`);
-      }
-      return { id };
-    },
-
-    async query<T = any>(sql: string, ...params: any[]): Promise<T[]> {
-      if (!initialized) await coreApi.init();
-      try {
-        const statement = db.prepare(sql);
-        if (statement.paramsCount > 0) {
-          return statement.all(...params) as T[];
-        } else {
-          return statement.all() as T[];
+    async updateOutput(input: z.infer<I>, output: Partial<z.infer<O>>, measureFn: MeasureFunction = defaultMeasure): Promise<{ id: string }> {
+      return await measureFn(async () => {
+        if (!initialized) await coreApi.init();
+        const validatedInput = inputSchema.parse(input);
+        const id = generateRecordId(validatedInput, inputSchema);
+        const validatedOutputUpdate = outputSchema.partial().parse(output);
+        if (Object.keys(validatedOutputUpdate).length === 0) {
+          console.log(`updateOutput called with empty output object for ID ${id}. No changes made.`);
+          return { id };
         }
-      } catch (error: any) {
-        console.error(`Error executing SQL: "${sql}" with params: ${JSON.stringify(params)}`, error?.message);
-        throw error;
-      }
+
+        const inputExists = db.query(`SELECT 1 FROM ${tableNames.inputTable} WHERE id = ?`).get(id);
+        if (!inputExists) {
+          throw new Error(`UpdateOutput failed: Input ID ${id} not found.`);
+        }
+
+        const existingOutputRow = db.query(`SELECT 1 FROM ${tableNames.outputTable} WHERE id = ?`).get(id);
+        if (existingOutputRow) {
+          throw new Error(`UpdateOutput failed: Output already exists for ID ${id}. Use upsert if overwrite is intended.`);
+        }
+
+        let fullOutputData: z.infer<O>;
+        try {
+          fullOutputData = outputSchema.parse(validatedOutputUpdate);
+        } catch (parseError: any) {
+          console.error(`Failed to parse partial output for ID ${id}:`, parseError.errors);
+          throw new Error(`UpdateOutput failed: Provided partial output is insufficient. ${parseError.message}`);
+        }
+
+        const processedOutput = processObjectForStorage(fullOutputData, outputSchema);
+        const columns = Object.keys(processedOutput);
+
+        if (columns.length > 0) {
+          const placeholders = columns.map(() => "?").join(", ");
+          db.query(`INSERT OR IGNORE INTO ${tableNames.outputTable} (id, ${columns.join(", ")}) VALUES (?, ${placeholders})`)
+            .run(id, ...Object.values(processedOutput));
+        } else {
+          console.warn(`updateOutput for ID ${id} resulted in zero columns. No output row inserted.`);
+        }
+        return { id };
+      }, `db_update_output_${baseName}_${id}`);
+    },
+
+    async delete(input: z.infer<I>, measureFn: MeasureFunction = defaultMeasure): Promise<{ id: string }> {
+      const validatedInput = inputSchema.parse(input);
+      const id = generateRecordId(validatedInput, inputSchema);
+      return await measureFn(async () => {
+        if (!initialized) await coreApi.init();
+        const result = db.query(`DELETE FROM ${tableNames.inputTable} WHERE id = ?`).run(id);
+        if (result.changes === 0) {
+          throw new Error(`Delete input failed: Record ID ${id} not found.`);
+        }
+        const result2 = db.query(`DELETE FROM ${tableNames.outputTable} WHERE id = ?`).run(id);
+        if (result2.changes === 0) {
+          throw new Error(`Delete output failed: Record ID ${id} not found.`);
+        }
+        return { id };
+      }, `db_delete_${baseName}_${id}`);
+    },
+
+    async query<T = any>(sql: string, params: any[], measureFn: MeasureFunction = defaultMeasure): Promise<T[]> {
+      return await measureFn(async () => {
+        if (!initialized) await coreApi.init();
+        try {
+          const statement = db.prepare(sql);
+          if (statement.paramsCount > 0) {
+            return statement.all(...params) as T[];
+          } else {
+            return statement.all() as T[];
+          }
+        } catch (error: any) {
+          console.error(`Error executing SQL: "${sql}" with params: ${JSON.stringify(params)}`, error?.message);
+          throw error;
+        }
+      }, `db_query_${baseName}`);
     },
 
     getInputSchema: () => inputSchema,
@@ -600,39 +664,43 @@ export function useDatabase<I extends z.ZodObject<any>, O extends z.ZodObject<an
   dbPath: string,
   inputSchema: I,
   outputSchema: O
-): [(input: z.infer<I>, output: z.infer<O> | null) => void, (query: Partial<z.infer<I>>) => (z.infer<O> & z.infer<I>)[]] {
+): [(input: z.infer<I>, output: z.infer<O> | null, measureFn?: MeasureFunction) => Promise<void>, (query: Partial<z.infer<I>>, measureFn?: MeasureFunction) => Promise<(z.infer<O> & z.infer<I>)[]>] {
   const coreDb = useSatiDbCore(dbPath, inputSchema, outputSchema);
 
-  const save = async (input: z.infer<I>, output: z.infer<O> | null) => {
-    await coreDb.init();
-    if (output === null) {
-      try {
-        await coreDb.delete(input);
-      } catch (error: any) {
-        if (!error.message.includes("not found")) {
-          console.error(`Error deleting record:`, error.message);
+  const save = async (input: z.infer<I>, output: z.infer<O> | null, measureFn: MeasureFunction = defaultMeasure) => {
+    await measureFn(async () => {
+      await coreDb.init();
+      if (output === null) {
+        try {
+          await coreDb.delete(input, measureFn);
+        } catch (error: any) {
+          if (!error.message.includes("not found")) {
+            console.error(`Error deleting record:`, error.message);
+          }
         }
+      } else {
+        await coreDb.upsert(input, output, measureFn);
       }
-    } else {
-      await coreDb.upsert(input, output);
-    }
+    }, `db_save_${path.basename(dbPath, path.extname(dbPath))}_${generateRecordId(input, inputSchema)}`);
   };
 
-  const find = async (query: Partial<z.infer<I>>): Promise<(z.infer<O> & z.infer<I>)[]> => {
-    await coreDb.init();
-    const inputFilter: Filter<I> = {};
-    for (const [key, value] of Object.entries(query)) {
-      if (value !== undefined) {
-        inputFilter[key as keyof z.infer<I>] = value as any;
+  const find = async (query: Partial<z.infer<I>>, measureFn: MeasureFunction = defaultMeasure) => {
+    return await measureFn(async () => {
+      await coreDb.init();
+      const inputFilter: Filter<I> = {};
+      for (const [key, value] of Object.entries(query)) {
+        if (value !== undefined) {
+          inputFilter[key as keyof z.infer<I>] = value as any;
+        }
       }
-    }
-    const results = await coreDb.findRaw({ input: inputFilter });
-    return results
-      .filter(record => record.input && Object.keys(record.input).length > 0)
-      .map(record => {
-        const merged: z.infer<O> & z.infer<I> = { ...record.output, ...record.input } as any;
-        return merged;
-      });
+      const results = await coreDb.findRaw({ input: inputFilter }, measureFn);
+      return results
+        .filter(record => record.input && Object.keys(record.input).length > 0)
+        .map(record => {
+          const merged: z.infer<O> & z.infer<I> = { ...record.output, ...record.input } as any;
+          return merged;
+        });
+    }, `db_find_${path.basename(dbPath, path.extname(dbPath))}`);
   };
 
   return [save, find];
